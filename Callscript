@@ -11,7 +11,7 @@
 (function () {
   'use strict';
 
-  const API_KEY = '6Fyu7sCMGBqj3me5'; // tua key
+  const API_KEY = 'INSERT PUBLIC API KEY HERE'; // tua key
 
   // ——————————————————————————————————
   // BLOCCO STABILE — NON MODIFICARE
