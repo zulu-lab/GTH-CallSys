@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         Torn - Call & Help (Profile/Attack, PDA, Long-Press Paste)
+// @name         Torn - Call, Help, Live (Profile/Attack, PDA, Long-Press Paste)
 // @namespace    http://tampermonkey.net/
-// @version      2.0
-// @description  Call: '! NOME5-ID in 5' | Help: '! Help🚨 <attack-link>' | Copia affidabile + long-press 1.5s (buffer 40s). Bottoni piccoli, su Profilo dentro "User Information", su Attacco accanto al nome target. PDA-friendly.
+// @version      2.5
+// @description  Call: '! NOME5-ID in 5' | Help: '! Help🚨 <attack-link>' | Live: rileva claim in chat e avvisa se target già preso (8 min). Copia affidabile + long-press 1.5s (buffer 40s). Bottoni piccoli, su Profilo dentro "User Information", su Attacco accanto al nome target. PDA-friendly.
 // @match        https://www.torn.com/*
 // @run-at       document-idle
 // @grant        GM_setClipboard
@@ -11,7 +11,9 @@
 (function () {
   'use strict';
 
-  const API_KEY = 'INSERT PUBLIC API KEY HERE'; // tua key
+  const API_KEY = 'PUBLIC API KEY'; // tua key
+  const CLAIM_TTL_MS = 8 * 60 * 1000;   // 8 minuti
+  const STORAGE_KEY  = 'torn_live_claims_v1';
 
   // ——————————————————————————————————
   // BLOCCO STABILE — NON MODIFICARE
@@ -22,10 +24,10 @@
     const t=document.createElement('div');
     t.textContent=msg;
     Object.assign(t.style,{position:'fixed',left:'50%',top:'92px',transform:'translateX(-50%)',
-      background:'rgba(0,0,0,.8)',color:'#fff',padding:'8px 12px',borderRadius:'8px',
+      background:'rgba(0,0,0,.85)',color:'#fff',padding:'8px 12px',borderRadius:'8px',
       fontSize:'14px',zIndex:2147483647,opacity:'0',transition:'opacity .15s',pointerEvents:'none'});
     document.body.appendChild(t); requestAnimationFrame(()=>t.style.opacity='1');
-    setTimeout(()=>{t.style.opacity='0'; setTimeout(()=>t.remove(),160);},1100);
+    setTimeout(()=>{t.style.opacity='0'; setTimeout(()=>t.remove(),160);},1400);
   };
 
   function getIdFromUrl() {
@@ -179,18 +181,140 @@
     return u.includes('profile.php?xid=') || u.includes('profiles.php?xid=');
   }
 
+  // ============= LIVE: store + osservazione chat =============
+  let liveEnabled = true; // default ON; puoi cambiare
+  let liveObserver = null;
+  let claimStore = loadClaims();
+
+  function loadClaims(){
+    try{
+      const raw = localStorage.getItem(STORAGE_KEY);
+      const obj = raw ? JSON.parse(raw) : {};
+      pruneClaims(obj);
+      return obj;
+    }catch(_){ return {}; }
+  }
+  function saveClaims(){
+    try{
+      pruneClaims(claimStore);
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(claimStore));
+    }catch(_){}
+  }
+  function pruneClaims(store){
+    const now=Date.now();
+    for (const id of Object.keys(store)){
+      if (!store[id] || (now - store[id].firstAt) > CLAIM_TTL_MS) delete store[id];
+    }
+  }
+  function addClaim(targetId, byName){
+    const now=Date.now();
+    if (!claimStore[targetId]){
+      claimStore[targetId] = { firstBy: byName, firstAt: now, times: 1, lastAt: now };
+    } else {
+      claimStore[targetId].times++;
+      claimStore[targetId].lastAt = now;
+    }
+    saveClaims();
+  }
+  function getClaim(targetId){
+    pruneClaims(claimStore);
+    return claimStore[targetId] || null;
+  }
+
+  function extractTargetIdFromText(txt){
+    if (!txt) return null;
+    // formato "! NAME5-1234567 in 5"
+    let m = txt.match(/\b[A-ZÀ-ÖØ-öø-ÿ]{1,12}-(\d{3,9})\b/);
+    if (m) return m[1];
+    // link tipo ...user2ID=1234567
+    m = txt.match(/user2ID=(\d{3,10})/i);
+    if (m) return m[1];
+    return null;
+  }
+  function findAuthorName(msgEl){
+    // prova vari selettori comuni per il nome autore nella bolla chat
+    const sels = [
+      '[class*="name"]','[class*="author"]','[class*="user"]','a[href*="profile.php"]','a[href*="profiles.php"]'
+    ];
+    for (const s of sels){
+      const e = msgEl.querySelector(s);
+      const t = (e?.textContent||'').trim();
+      if (t) return t;
+    }
+    // fallback: testo precedente la bolla
+    const t = (msgEl.textContent||'').trim();
+    const first = t.split(':')[0];
+    return first.length && first.length<40 ? first : 'Unknown';
+  }
+  function handleNewMessage(node){
+    try{
+      const txt = (node.textContent||'').trim();
+      const targetId = extractTargetIdFromText(txt);
+      if (!targetId) return;
+      const by = findAuthorName(node);
+      addClaim(targetId, by);
+      // opzionale: piccolo avviso discreto
+      // toast(`Live: ${by} → ${targetId}`);
+    }catch(_){}
+  }
+  function startLiveObserver(){
+    if (!liveEnabled) return;
+    if (liveObserver) return;
+    // Prova a individuare il contenitore chat
+    const chatContainers = [
+      '[class*="chat"] [class*="messages"]',
+      '[class*="chat"] [class*="list"]',
+      '[class*="chat"]',
+      '[class*="faction"] [class*="messages"]'
+    ];
+    let root=null;
+    for (const s of chatContainers){
+      const el = document.querySelector(s);
+      if (el){ root=el; break; }
+    }
+    if (!root) {
+      // fallback: osserva body e filtra
+      root = document.body;
+    }
+    liveObserver = new MutationObserver((muts)=>{
+      if (!liveEnabled) return;
+      for (const m of muts){
+        for (const n of m.addedNodes){
+          if (!(n instanceof HTMLElement)) continue;
+          // cerca bolla messaggio
+          const bubbles = n.matches?.('[class*="message"]') ? [n] : Array.from(n.querySelectorAll?.('[class*="message"], li, .msg, .message')||[]);
+          for (const b of bubbles) handleNewMessage(b);
+        }
+      }
+    });
+    liveObserver.observe(root, { childList:true, subtree:true });
+  }
+  function stopLiveObserver(){
+    if (liveObserver){ liveObserver.disconnect(); liveObserver=null; }
+  }
+
   // —— Azioni Call/Help ——
   function onCallClick(e){
     e.preventDefault(); e.stopPropagation();
     const id=getIdFromUrl();
     if (!id){ toast('⚠️ Nessun ID nell’URL'); return; }
     if (!(cached.id===id && cached.name)){ toast('⏳ Nome non pronto: attendi 1s e riprova'); return; }
+
+    // LIVE: controlla se già reclamato
+    const claim = getClaim(id);
+    if (liveEnabled && claim){
+      const ago = Math.max(1, Math.round((Date.now()-claim.firstAt)/1000));
+      const ok = confirm(`⚠️ Target ${id} già chiamato da ${claim.firstBy} • ${claim.times} volte • ${ago}s fa.\nVuoi procedere comunque?`);
+      if (!ok) return;
+    }
+
     const shortName = cached.name.replace(/[^A-Za-zÀ-ÖØ-öø-ÿ]/g,'').toUpperCase().slice(0,5);
     const msg = `! ${shortName}-${id} in 5`;
     const ok = copyNow(msg);
     if (ok){ lastCopied={ text:msg, ts:Date.now() }; toast('✅ Copiato (long‑press 1.5s, valido 40s)'); }
     else { toast('⚠️ Copia bloccata: incolla manualmente'); }
   }
+
   function onHelpClick(e){
     e.preventDefault(); e.stopPropagation();
     const id=getIdFromUrl();
@@ -200,6 +324,15 @@
     const ok = copyNow(msg);
     if (ok){ lastCopied={ text:msg, ts:Date.now() }; toast('✅ Copiato (long‑press 1.5s, valido 40s)'); }
     else { toast('⚠️ Copia bloccata: incolla manualmente'); }
+  }
+
+  function onLiveToggle(e){
+    e.preventDefault(); e.stopPropagation();
+    liveEnabled = !liveEnabled;
+    const btn = document.getElementById('live-btn');
+    if (btn) btn.textContent = liveEnabled ? 'Live On' : 'Live Off';
+    if (liveEnabled){ startLiveObserver(); toast('🟢 Live attivo'); }
+    else { stopLiveObserver(); toast('🔴 Live disattivato'); }
   }
 
   // —— Visibilità / misura / nome target ——
@@ -240,7 +373,7 @@
     const gap=Math.round(pxFromCm(1));
     Object.assign(wrap.style,{ position:'fixed', top:Math.max(0, rect.top+2)+'px', left:Math.round(rect.right+gap)+'px',
       transform:'none', right:'auto', zIndex:2147483647 });
-    const w=wrap.getBoundingClientRect().width||120;
+    const w=wrap.getBoundingClientRect().width||160;
     if (rect.right+gap+w>window.innerWidth-8){
       Object.assign(wrap.style,{ left:Math.max(8, rect.left-gap-w)+'px' });
     }
@@ -248,6 +381,10 @@
   }
 
   // —— Profilo: trova barra “User Information” e monta i bottoni dentro ——
+  function isProfilePage(){
+    const u = location.href.toLowerCase();
+    return u.includes('profile.php?xid=') || u.includes('profiles.php?xid=');
+  }
   function findProfileInfoBar(){
     if (!isProfilePage()) return null;
     const headings=document.querySelectorAll('h1,h2,h3,.title,.title-black,.content-title,[class*="title"]');
@@ -273,7 +410,7 @@
     return true;
   }
 
-  // —— Bottoni (ridotti ~30%) —— 
+  // —— Bottoni (Call, Help, Live) —— 
   function ensureButtons(){
     const show=isAttackOrProfile();
     let wrap=document.getElementById('call-help-wrap');
@@ -300,7 +437,11 @@
       };
       wrap.appendChild(makeBtn('Call', '#ffb703', onCallClick, 'call-btn'));
       wrap.appendChild(makeBtn('Help', '#ff6b6b', onHelpClick, 'help-btn'));
+      wrap.appendChild(makeBtn(liveEnabled ? 'Live On' : 'Live Off', '#9be579', onLiveToggle, 'live-btn'));
       document.body.appendChild(wrap);
+    } else {
+      const lb=document.getElementById('live-btn');
+      if (lb) lb.textContent = liveEnabled ? 'Live On' : 'Live Off';
     }
 
     if (isProfilePage()){
@@ -342,6 +483,11 @@
     setInterval(ensureButtons, 2000);
     const preTimer=setInterval(prefetch, 1500);
     setTimeout(()=>clearInterval(preTimer), 15000);
+
+    // live
+    if (liveEnabled) startLiveObserver();
+    // pulizia periodica claims
+    setInterval(()=>{ pruneClaims(claimStore); saveClaims(); }, 60*1000);
   }
 
   if (document.readyState==='complete' || document.readyState==='interactive') setTimeout(boot,300);
